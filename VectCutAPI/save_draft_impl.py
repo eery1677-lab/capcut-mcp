@@ -215,6 +215,15 @@ def save_draft_background(draft_id, draft_folder, task_id):
         script.dump(os.path.join(current_dir, f"{draft_id}/draft_info.json"))
         logger.info(f"Draft information has been saved to {os.path.join(current_dir, draft_id)}/draft_info.json.")
 
+        # Copy draft folder to local draft_folder if specified
+        if draft_folder:
+            dest_draft_path = os.path.join(draft_folder, draft_id)
+            logger.info(f"Copying draft from {os.path.join(current_dir, draft_id)} to local path: {dest_draft_path}")
+            if os.path.exists(dest_draft_path):
+                shutil.rmtree(dest_draft_path)
+            shutil.copytree(os.path.join(current_dir, draft_id), dest_draft_path)
+            logger.info("Successfully copied draft to local CapCut projects directory.")
+
         draft_url = ""
         # Only upload draft information when IS_UPLOAD_DRAFT is True
         if IS_UPLOAD_DRAFT:
