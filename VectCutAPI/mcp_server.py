@@ -132,16 +132,17 @@ TOOLS = [
                 "end": {"type": "number", "description": "结束时间（秒）"},
                 "draft_id": {"type": "string", "description": "草稿ID"},
                 "font_color": {"type": "string", "default": "#ffffff", "description": "字体颜色"},
-                "font_size": {"type": "integer", "default": 24, "description": "字体大小"},
+                # Defaults below mirror add_text_impl's real defaults; the server does not apply schema defaults.
+                "font_size": {"type": "number", "default": 8.0, "description": "字体大小 (CapCut native size units, written as-is; 8.0 = CapCut default)"},
                 "shadow_enabled": {"type": "boolean", "default": False, "description": "是否启用文字阴影"},
                 "shadow_color": {"type": "string", "default": "#000000", "description": "阴影颜色"},
-                "shadow_alpha": {"type": "number", "default": 0.8, "description": "阴影透明度"},
-                "shadow_angle": {"type": "number", "default": 315.0, "description": "阴影角度"},
+                "shadow_alpha": {"type": "number", "default": 0.9, "description": "阴影透明度"},
+                "shadow_angle": {"type": "number", "default": -45.0, "description": "阴影角度"},
                 "shadow_distance": {"type": "number", "default": 5.0, "description": "阴影距离"},
-                "shadow_smoothing": {"type": "number", "default": 0.0, "description": "阴影平滑度"},
+                "shadow_smoothing": {"type": "number", "default": 0.15, "description": "阴影平滑度"},
                 "background_color": {"type": "string", "description": "背景颜色"},
-                "background_alpha": {"type": "number", "default": 1.0, "description": "背景透明度"},
-                "background_style": {"type": "integer", "default": 0, "description": "背景样式"},
+                "background_alpha": {"type": "number", "default": 0.0, "description": "背景透明度 (default 0 = invisible; set >0 together with background_color)"},
+                "background_style": {"type": "integer", "default": 1, "description": "背景样式"},
                 "background_round_radius": {"type": "number", "default": 0.0, "description": "背景圆角半径"},
                 "text_styles": {"type": "array", "description": "文本多样式配置列表"}
             },
@@ -247,12 +248,20 @@ TOOLS = [
     },
     {
         "name": "save_draft",
-        "description": "保存草稿",
+        "description": "保存草稿 / Save a draft. If draft_folder is given, the draft is copied to <draft_folder>/<draft_id>; "
+                       "existing folders are never overwritten. Returns the actual saved path (draft_path).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "draft_id": {"type": "string", "description": "草稿ID"}
-            }
+                "draft_id": {"type": "string", "description": "草稿ID"},
+                "draft_folder": {
+                    "type": "string",
+                    "description": "Optional absolute path to an existing drafts root folder "
+                                   "(e.g. CapCut's ...\\User Data\\Projects\\com.lveditor.draft). "
+                                   "Omit to keep the draft only in the VectCutAPI working directory."
+                }
+            },
+            "required": ["draft_id"]
         }
     }
 ]
@@ -345,11 +354,22 @@ def execute_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
                 result = {"duration": duration}
                 
             elif tool_name == "save_draft":
-                save_result = save_draft_impl(**arguments)
-                if isinstance(save_result, dict) and "draft_url" in save_result:
-                    result = {"draft_url": save_result["draft_url"]}
-                else:
-                    result = {"draft_url": f"https://www.install-ai-guider.top/draft/downloader?draft_id=unknown"}
+                draft_id = arguments.get("draft_id")
+                if not draft_id:
+                    return {"success": False, "error": "draft_id is required"}
+                save_result = save_draft_impl(draft_id, arguments.get("draft_folder"))
+                if not isinstance(save_result, dict) or not save_result.get("success"):
+                    error = save_result.get("error") if isinstance(save_result, dict) else None
+                    return {"success": False, "error": error or "save_draft failed for an unknown reason"}
+                result = {
+                    "draft_id": draft_id,
+                    "draft_path": save_result.get("draft_path"),
+                    "working_path": save_result.get("working_path"),
+                    "draft_url": save_result.get("draft_url") or None,
+                    "project_id": save_result.get("project_id"),
+                    "draft_name": save_result.get("draft_name"),
+                    "duration_us": save_result.get("duration_us"),
+                }
                 
             else:
                 return {"success": False, "error": f"Unknown tool: {tool_name}"}

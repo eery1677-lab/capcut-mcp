@@ -50,9 +50,145 @@ def build_asset_path(draft_folder: str, draft_id: str, asset_type: str, material
         draft_real_path = os.path.join(draft_folder, draft_id, "assets", asset_type, material_name)
     return draft_real_path
 
-def save_draft_background(draft_id, draft_folder, task_id):
-    """Background save draft to OSS"""
+_SAFE_DRAFT_ID = re.compile(r'^[A-Za-z0-9_\-]+$')
+_DRAFT_MARKER_FILES = ("draft_info.json", "draft_content.json", "draft_meta_info.json")
+
+
+class DraftSaveError(Exception):
+    """Raised when a draft cannot be saved safely."""
+
+
+def validate_save_target(draft_id: str, draft_folder: str = None) -> str:
+    """
+    Validate the draft ID and (optional) destination folder before any files are written.
+
+    :return: Absolute path the draft will be saved to inside draft_folder, or None if no draft_folder.
+    :raises DraftSaveError: If the target is invalid or would overwrite an existing draft.
+    """
+    if not isinstance(draft_id, str) or not _SAFE_DRAFT_ID.match(draft_id):
+        raise DraftSaveError(f"Invalid draft_id {draft_id!r}: only letters, digits, '_' and '-' are allowed")
+
+    if draft_folder is None:
+        return None
+    if not isinstance(draft_folder, str) or not draft_folder.strip():
+        raise DraftSaveError("draft_folder must be a non-empty path string")
+
+    folder = os.path.expandvars(os.path.expanduser(draft_folder.strip()))
+    if not os.path.isabs(folder):
+        raise DraftSaveError(f"draft_folder must be an absolute path, got {draft_folder!r}")
+    folder = os.path.realpath(folder)
+
+    if not os.path.isdir(folder):
+        raise DraftSaveError(f"draft_folder does not exist or is not a directory: {folder}")
+    if not os.access(folder, os.W_OK):
+        raise DraftSaveError(f"draft_folder is not writable: {folder}")
+
+    working_dir = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.normcase(folder) == os.path.normcase(working_dir):
+        raise DraftSaveError("draft_folder cannot be the VectCutAPI working directory")
+
+    # Refuse to nest a new draft inside an existing CapCut project folder
+    if any(os.path.exists(os.path.join(folder, marker)) for marker in _DRAFT_MARKER_FILES):
+        raise DraftSaveError(f"draft_folder appears to be an existing draft project, not a drafts root: {folder}")
+
+    dest = os.path.join(folder, draft_id)
+    if os.path.lexists(dest):
+        raise DraftSaveError(f"Destination already exists, refusing to overwrite: {dest}")
+    return dest
+
+
+def _copy_without_overwrite(src: str, dest: str) -> None:
+    """Copy src to dest via a temp sibling + rename, so an existing dest is never replaced."""
+    staging = f"{dest}.saving-{uuid.uuid4().hex[:8]}"
     try:
+        shutil.copytree(src, staging)
+        if os.path.lexists(dest):
+            raise DraftSaveError(f"Destination appeared during save, refusing to overwrite: {dest}")
+        os.rename(staging, dest)  # fails instead of replacing if dest was created concurrently
+    finally:
+        if os.path.exists(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _capcut_path(path: str) -> str:
+    """CapCut stores project paths with forward slashes, e.g. D:/Capcut Draft/CapCut Drafts/1123."""
+    return os.path.abspath(path).replace("\\", "/")
+
+
+def _write_json(path: str, data) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def finalize_capcut_draft_files(working_path: str, draft_name: str, final_path: str) -> Dict:
+    """
+    Make the built draft match what current CapCut desktop versions expect.
+
+    - Gives the timeline a unique id (the bundled template hardcodes one id for every draft).
+    - Writes the timeline as draft_content.json (read by CapCut) and keeps draft_info.json in sync.
+    - Rewrites draft_meta_info.json: unique project id, name, real destination paths, duration,
+      timestamps, local-only (no cloud sync) - removing the template's hardcoded Mac paths.
+    - Removes draft_info.json.bak, a stale copy of the template timeline.
+
+    :param working_path: Folder the draft was built in.
+    :param draft_name: Project name (also the folder name).
+    :param final_path: Folder the draft will finally live in (used for the paths in metadata).
+    :return: Summary of the written metadata.
+    """
+    info_path = os.path.join(working_path, "draft_info.json")
+    content_path = os.path.join(working_path, "draft_content.json")
+    meta_path = os.path.join(working_path, "draft_meta_info.json")
+
+    with open(info_path, "r", encoding="utf-8") as f:
+        content = json.load(f)
+    content["id"] = str(uuid.uuid4()).upper()
+    _write_json(content_path, content)
+    _write_json(info_path, content)
+
+    stale_backup = os.path.join(working_path, "draft_info.json.bak")
+    if os.path.exists(stale_backup):
+        os.remove(stale_backup)
+
+    meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    now_us = int(time.time() * 1_000_000)
+    duration = int(content.get("duration") or 0)
+    meta.update({
+        "draft_id": str(uuid.uuid4()).upper(),
+        "draft_name": draft_name,
+        "draft_fold_path": _capcut_path(final_path),
+        "draft_root_path": _capcut_path(os.path.dirname(os.path.abspath(final_path))),
+        "tm_duration": duration,
+        "tm_draft_create": now_us,
+        "tm_draft_modified": now_us,
+        "tm_draft_removed": 0,
+        "draft_timeline_materials_size_": os.path.getsize(content_path),
+        "cloud_draft_cover": False,
+        "cloud_draft_sync": False,
+        "draft_need_rename_folder": False,
+    })
+    _write_json(meta_path, meta)
+
+    return {
+        "project_id": meta["draft_id"],
+        "timeline_id": content["id"],
+        "draft_name": draft_name,
+        "duration_us": duration,
+    }
+
+
+def save_draft_background(draft_id, draft_folder, task_id):
+    """
+    Build the draft locally, optionally copy it to draft_folder and/or upload it.
+
+    :return: dict with draft_url, draft_path (final location) and working_path.
+    :raises Exception: On any failure (task status is also set to failed).
+    """
+    try:
+        dest_draft_path = validate_save_target(draft_id, draft_folder)
+
         # Get draft information from global cache
         if draft_id not in DRAFT_CACHE:
             task_status = {
@@ -65,8 +201,8 @@ def save_draft_background(draft_id, draft_folder, task_id):
             }
             update_tasks_cache(task_id, task_status)  # Use new cache management function
             logger.error(f"Draft {draft_id} does not exist in cache, task {task_id} failed.")
-            return
-            
+            raise DraftSaveError(f"Draft {draft_id} does not exist in cache (was the MCP server restarted?)")
+
         script = DRAFT_CACHE[draft_id]
         logger.info(f"Successfully retrieved draft {draft_id} from cache.")
         
@@ -82,14 +218,17 @@ def save_draft_background(draft_id, draft_folder, task_id):
         update_tasks_cache(task_id, task_status)  # Use new cache management function
         logger.info(f"Task {task_id} status updated to 'processing': Preparing draft files.")
         
-        # Delete possibly existing draft_id folder
-        if os.path.exists(draft_id):
-            logger.warning(f"Deleting existing draft folder (current working directory): {draft_id}")
-            shutil.rmtree(draft_id)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        working_path = os.path.join(current_dir, draft_id)
+
+        # Delete a stale build copy of this draft in the VectCutAPI working directory only
+        # (draft_id is validated as a plain folder name, so this cannot escape current_dir)
+        if os.path.exists(working_path):
+            logger.warning(f"Deleting stale working copy: {working_path}")
+            shutil.rmtree(working_path)
 
         logger.info(f"Starting to save draft: {draft_id}")
         # Save draft
-        current_dir = os.path.dirname(os.path.abspath(__file__))
         draft_folder_for_duplicate = draft.Draft_folder(current_dir)
         # Choose different template directory based on configuration
         template_dir = "template" if IS_CAPCUT_ENV else "template_jianying"
@@ -215,14 +354,24 @@ def save_draft_background(draft_id, draft_folder, task_id):
         script.dump(os.path.join(current_dir, f"{draft_id}/draft_info.json"))
         logger.info(f"Draft information has been saved to {os.path.join(current_dir, draft_id)}/draft_info.json.")
 
-        # Copy draft folder to local draft_folder if specified
-        if draft_folder:
-            dest_draft_path = os.path.join(draft_folder, draft_id)
-            logger.info(f"Copying draft from {os.path.join(current_dir, draft_id)} to local path: {dest_draft_path}")
-            if os.path.exists(dest_draft_path):
-                shutil.rmtree(dest_draft_path)
-            shutil.copytree(os.path.join(current_dir, draft_id), dest_draft_path)
-            logger.info("Successfully copied draft to local CapCut projects directory.")
+        if not os.path.isfile(os.path.join(working_path, "draft_info.json")):
+            raise DraftSaveError(f"draft_info.json was not written to {working_path}")
+
+        # Write CapCut-compatible draft_content.json / draft_meta_info.json for the final location
+        project_info = finalize_capcut_draft_files(working_path, draft_id, dest_draft_path or working_path)
+        logger.info(f"CapCut project files written: {project_info}")
+
+        required_files = ("draft_content.json", "draft_info.json", "draft_meta_info.json")
+        # Copy draft folder to local draft_folder if specified (never overwrites)
+        final_path = working_path
+        if dest_draft_path:
+            logger.info(f"Copying draft from {working_path} to local path: {dest_draft_path}")
+            _copy_without_overwrite(working_path, dest_draft_path)
+            missing = [f for f in required_files if not os.path.isfile(os.path.join(dest_draft_path, f))]
+            if missing:
+                raise DraftSaveError(f"Copy finished but {', '.join(missing)} missing in {dest_draft_path}")
+            final_path = dest_draft_path
+            logger.info(f"Successfully copied draft to {dest_draft_path}")
 
         draft_url = ""
         # Only upload draft information when IS_UPLOAD_DRAFT is True
@@ -246,44 +395,55 @@ def save_draft_background(draft_id, draft_folder, task_id):
             logger.info(f"Draft archive has been uploaded to OSS, URL: {draft_url}")
             update_task_field(task_id, "draft_url", draft_url)
 
-            # Clean up temporary files
-            if os.path.exists(os.path.join(current_dir, draft_id)):
-                shutil.rmtree(os.path.join(current_dir, draft_id))
-                logger.info(f"Cleaned up temporary draft folder: {os.path.join(current_dir, draft_id)}")
+        # Remove the build copy once it lives somewhere else (uploaded or copied to draft_folder)
+        working_kept = True
+        if (IS_UPLOAD_DRAFT or dest_draft_path) and os.path.exists(working_path):
+            shutil.rmtree(working_path, ignore_errors=True)
+            working_kept = os.path.exists(working_path)
+            logger.info(f"Cleaned up temporary draft folder: {working_path}")
 
-    
         # Update task status - Completed
         update_task_field(task_id, "status", "completed")
         update_task_field(task_id, "progress", 100)
         update_task_field(task_id, "message", "Draft creation completed")
-        logger.info(f"Task {task_id} completed, draft URL: {draft_url}")
-        return draft_url
+        logger.info(f"Task {task_id} completed, draft path: {final_path}, draft URL: {draft_url}")
+        return {
+            "draft_url": draft_url,
+            "draft_path": final_path if os.path.exists(final_path) else None,
+            "working_path": working_path if working_kept else None,
+            **project_info,
+        }
 
     except Exception as e:
         # Update task status - Failed
-        update_task_fields(task_id, 
+        update_task_fields(task_id,
                           status="failed",
                           message=f"Failed to save draft: {str(e)}")
         logger.error(f"Saving draft {draft_id} task {task_id} failed: {str(e)}", exc_info=True)
-        return ""
+        raise
 
 def query_task_status(task_id: str):
     return get_task_status(task_id)
 
 def save_draft_impl(draft_id: str, draft_folder: str = None) -> Dict[str, str]:
-    """Start a background task to save the draft"""
+    """
+    Save the draft (synchronously).
+
+    :return: {"success": True, "draft_url", "draft_path", "working_path"} on success,
+             {"success": False, "error"} on failure. Existing drafts are never overwritten.
+    """
     logger.info(f"Received save draft request: draft_id={draft_id}, draft_folder={draft_folder}")
     try:
+        # Fail fast before creating a task or writing any files
+        validate_save_target(draft_id, draft_folder)
+
         # Generate a unique task ID
         task_id = draft_id
         create_task(task_id)
         logger.info(f"Task {task_id} has been created.")
-        
+
         # Changed to synchronous execution
-        return {
-            "success": True,
-            "draft_url": save_draft_background(draft_id, draft_folder, task_id)
-            }
+        return {"success": True, **save_draft_background(draft_id, draft_folder, task_id)}
 
         # # Start a background thread to execute the task
         # thread = threading.Thread(
